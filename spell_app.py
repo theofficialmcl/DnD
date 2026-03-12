@@ -73,8 +73,9 @@ DEFAULT_COLORS = [
 
 
 # ----------------------------
-# Math helpers
+# Cached math helpers
 # ----------------------------
+@st.cache_data
 def dice_distribution(num_dice: int, die_size: int) -> Dict[int, float]:
     dist = Counter({0: 1.0})
     for _ in range(num_dice):
@@ -86,11 +87,8 @@ def dice_distribution(num_dice: int, die_size: int) -> Dict[int, float]:
     return dict(sorted(dist.items()))
 
 
+@st.cache_data
 def single_d20_distribution(mode: str = "normal") -> Dict[int, float]:
-    """
-    mode: 'normal', 'advantage', 'disadvantage'
-    Returns distribution of the final d20 result.
-    """
     if mode == "normal":
         return {r: 1 / 20 for r in range(1, 21)}
 
@@ -109,6 +107,7 @@ def single_d20_distribution(mode: str = "normal") -> Dict[int, float]:
     return {r: counts[r] / total for r in range(1, 21)}
 
 
+@st.cache_data
 def save_success_probability(save_dc: int, save_bonus: int, mode: str = "normal") -> float:
     d20_dist = single_d20_distribution(mode)
     return sum(
@@ -117,15 +116,23 @@ def save_success_probability(save_dc: int, save_bonus: int, mode: str = "normal"
     )
 
 
-def spell_outcome_distribution(spell: Spell, save_bonus: int, save_dc: int, mode: str = "normal") -> Dict[int, float]:
-    base_dist = dice_distribution(spell.num_dice, spell.die_size)
+@st.cache_data
+def spell_outcome_distribution(
+    num_dice: int,
+    die_size: int,
+    half_on_save: bool,
+    save_bonus: int,
+    save_dc: int,
+    mode: str = "normal",
+) -> Dict[int, float]:
+    base_dist = dice_distribution(num_dice, die_size)
     p_save = save_success_probability(save_dc, save_bonus, mode=mode)
     p_fail = 1.0 - p_save
 
     final_dist = Counter()
     for dmg, prob in base_dist.items():
         final_dist[dmg] += prob * p_fail
-        saved_dmg = dmg // 2 if spell.half_on_save else 0
+        saved_dmg = dmg // 2 if half_on_save else 0
         final_dist[saved_dmg] += prob * p_save
 
     return dict(sorted(final_dist.items()))
@@ -148,8 +155,23 @@ def distribution_peak(distribution: Dict[int, float]) -> Tuple[int, float]:
     return peak_x, distribution[peak_x]
 
 
-def expected_spell_damage(spell: Spell, save_bonus: int, save_dc: int, mode: str = "normal") -> float:
-    return expected_value(spell_outcome_distribution(spell, save_bonus, save_dc, mode=mode))
+def expected_spell_damage(
+    num_dice: int,
+    die_size: int,
+    half_on_save: bool,
+    save_bonus: int,
+    save_dc: int,
+    mode: str = "normal",
+) -> float:
+    dist = spell_outcome_distribution(
+        num_dice=num_dice,
+        die_size=die_size,
+        half_on_save=half_on_save,
+        save_bonus=save_bonus,
+        save_dc=save_dc,
+        mode=mode,
+    )
+    return expected_value(dist)
 
 
 def get_spell_dc(spell: Spell, global_dc: int) -> int:
@@ -173,7 +195,7 @@ if "spells" not in st.session_state:
 # Header
 # ----------------------------
 st.title("D&D Spell Damage Analyzer")
-st.caption("Hoverable damage distributions and save comparison for normal, advantage, and disadvantage.")
+st.caption("Interactive spell distribution and save comparison with hover data, multiple spells, and advantage/disadvantage support.")
 
 
 # ----------------------------
@@ -201,7 +223,6 @@ with st.sidebar:
         value=15,
         step=1,
         key="global_dc_slider",
-        on_change=lambda: None,
     )
 
     st.divider()
@@ -301,52 +322,69 @@ if not visible_spells:
 # ----------------------------
 # Summary table
 # ----------------------------
-st.subheader("Current Spell Summary")
+with st.expander("Current Spell Summary", expanded=False):
+    rows = []
+    for spell in visible_spells:
+        dc = get_spell_dc(spell, global_dc)
+        save_bonus = int(target_saves[spell.save_stat])
 
-rows = []
-for spell in visible_spells:
-    dc = get_spell_dc(spell, global_dc)
-    save_bonus = int(target_saves[spell.save_stat])
-    dist = spell_outcome_distribution(spell, save_bonus, dc, mode="normal")
-    mean = expected_value(dist)
-    sd = std_dev(dist, mean)
-    peak_x, peak_p = distribution_peak(dist)
-    p_save = save_success_probability(dc, save_bonus, mode="normal")
+        dist = spell_outcome_distribution(
+            num_dice=spell.num_dice,
+            die_size=spell.die_size,
+            half_on_save=spell.half_on_save,
+            save_bonus=save_bonus,
+            save_dc=dc,
+            mode="normal",
+        )
+        mean = expected_value(dist)
+        sd = std_dev(dist, mean)
+        peak_x, peak_p = distribution_peak(dist)
+        p_save = save_success_probability(dc, save_bonus, mode="normal")
 
-    rows.append(
-        {
-            "Name": spell.name,
-            "Damage": f"{spell.num_dice}d{spell.die_size}",
-            "Save": spell.save_stat,
-            "DC Used": dc,
-            "Half on Save": spell.half_on_save,
-            "Target Save Bonus": save_bonus,
-            "Save Chance": f"{p_save:.1%}",
-            "Mean": round(mean, 3),
-            "Std Dev": round(sd, 3),
-            "Peak Damage": peak_x,
-            "Peak Probability": f"{peak_p:.1%}",
-        }
-    )
+        rows.append(
+            {
+                "Name": spell.name,
+                "Damage": f"{spell.num_dice}d{spell.die_size}",
+                "Save": spell.save_stat,
+                "DC Used": dc,
+                "Half on Save": spell.half_on_save,
+                "Target Save Bonus": save_bonus,
+                "Save Chance": f"{p_save:.1%}",
+                "Mean": round(mean, 3),
+                "Std Dev": round(sd, 3),
+                "Peak Damage": peak_x,
+                "Peak Probability": f"{peak_p:.1%}",
+            }
+        )
 
-st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 
 # ----------------------------
-# Distribution graph
+# Main distribution graph
 # ----------------------------
 st.subheader("Spell Damage Distribution")
 
-show_mean = st.checkbox("Show mean markers", value=True)
-show_std = st.checkbox("Show ±1σ markers", value=True)
-show_peak = st.checkbox("Show peak markers", value=True)
+show_markers = st.checkbox("Show data point markers", value=True)
+line_width = st.slider("Line width", min_value=1, max_value=6, value=3, step=1)
+
+chart_placeholder = st.empty()
 
 fig = go.Figure()
 
 for spell in visible_spells:
     dc = get_spell_dc(spell, global_dc)
     save_bonus = int(target_saves[spell.save_stat])
-    dist = spell_outcome_distribution(spell, save_bonus, dc, mode="normal")
+
+    dist = spell_outcome_distribution(
+        num_dice=spell.num_dice,
+        die_size=spell.die_size,
+        half_on_save=spell.half_on_save,
+        save_bonus=save_bonus,
+        save_dc=dc,
+        mode="normal",
+    )
+
     mean = expected_value(dist)
     sd = std_dev(dist, mean)
     peak_x, peak_p = distribution_peak(dist)
@@ -362,6 +400,7 @@ for spell in visible_spells:
             f"Mean: {mean:.2f}<br>"
             f"Std Dev: {sd:.2f}<br>"
             f"Peak Damage: {peak_x}<br>"
+            f"Peak Probability: {peak_p:.3%}<br>"
             f"DC: {dc}<br>"
             f"Save Stat: {spell.save_stat}<br>"
             f"Target Save Bonus: {save_bonus}"
@@ -369,111 +408,101 @@ for spell in visible_spells:
         for x, y in zip(x_vals, y_vals)
     ]
 
-    # Main distribution: markers only
     fig.add_trace(
         go.Scatter(
             x=x_vals,
             y=y_vals,
-            mode="markers",
+            mode="lines+markers" if show_markers else "lines",
             name=spell.name,
+            line=dict(color=spell.color, width=line_width, shape="linear"),
             marker=dict(
                 color=spell.color,
-                size=9,
-                line=dict(color="rgba(255,255,255,0.15)", width=0.8),
+                size=7 if show_markers else 0,
+                line=dict(color="rgba(255,255,255,0.12)", width=0.8),
             ),
             hoverinfo="text",
             hovertext=hover_text,
         )
     )
 
-    # Peak marker
-    if show_peak:
-        fig.add_trace(
-            go.Scatter(
-                x=[peak_x],
-                y=[peak_p],
-                mode="markers",
-                name=f"{spell.name} Peak",
-                marker=dict(color=spell.color, size=15, symbol="diamond"),
-                showlegend=False,
-                hovertemplate=(
-                    f"<b>{spell.name} Peak</b><br>"
-                    f"Peak Damage: {peak_x}<br>"
-                    f"Peak Probability: {peak_p:.3%}<br>"
-                    f"Mean: {mean:.2f}<br>"
-                    f"Std Dev: {sd:.2f}<extra></extra>"
-                ),
-            )
+    # Invisible hover targets for mean / std dev / peak
+    fig.add_trace(
+        go.Scatter(
+            x=[peak_x],
+            y=[peak_p],
+            mode="markers",
+            marker=dict(size=16, color=spell.color, opacity=0.001),
+            showlegend=False,
+            hovertemplate=(
+                f"<b>{spell.name} Peak</b><br>"
+                f"Peak Damage: {peak_x}<br>"
+                f"Peak Probability: {peak_p:.3%}<br>"
+                f"Mean: {mean:.2f}<br>"
+                f"Std Dev: {sd:.2f}<extra></extra>"
+            ),
         )
+    )
 
-    # Mean marker
-    if show_mean:
-        mean_y = dist.get(int(round(mean)), 0.0)
-        fig.add_trace(
-            go.Scatter(
-                x=[mean],
-                y=[mean_y],
-                mode="markers",
-                name=f"{spell.name} Mean",
-                marker=dict(color=spell.color, size=14, symbol="x"),
-                showlegend=False,
-                hovertemplate=(
-                    f"<b>{spell.name} Mean</b><br>"
-                    f"Mean: {mean:.2f}<br>"
-                    f"Std Dev: {sd:.2f}<extra></extra>"
-                ),
-            )
+    fig.add_trace(
+        go.Scatter(
+            x=[mean],
+            y=[max(y_vals) * 0.95],
+            mode="markers",
+            marker=dict(size=16, color=spell.color, opacity=0.001),
+            showlegend=False,
+            hovertemplate=(
+                f"<b>{spell.name} Mean</b><br>"
+                f"Mean: {mean:.2f}<br>"
+                f"Std Dev: {sd:.2f}<extra></extra>"
+            ),
         )
+    )
 
-    # Std dev markers
-    if show_std:
-        left_x = mean - sd
-        right_x = mean + sd
-        fig.add_trace(
-            go.Scatter(
-                x=[left_x, right_x],
-                y=[0, 0],
-                mode="markers",
-                name=f"{spell.name} Std Dev",
-                marker=dict(color=spell.color, size=11, symbol="square-open"),
-                showlegend=False,
-                hovertemplate=(
-                    f"<b>{spell.name} Std Dev</b><br>"
-                    f"Value: %{ '{x:.2f}' }<br>"
-                    f"Mean: {mean:.2f}<br>"
-                    f"Std Dev: {sd:.2f}<extra></extra>"
-                ),
-            )
+    fig.add_trace(
+        go.Scatter(
+            x=[mean - sd, mean + sd],
+            y=[max(y_vals) * 0.88, max(y_vals) * 0.88],
+            mode="markers",
+            marker=dict(size=16, color=spell.color, opacity=0.001),
+            showlegend=False,
+            hovertemplate=(
+                f"<b>{spell.name} Std Dev Marker</b><br>"
+                f"Value: %{{x:.2f}}<br>"
+                f"Mean: {mean:.2f}<br>"
+                f"Std Dev: {sd:.2f}<extra></extra>"
+            ),
         )
+    )
 
-fig.update_layout(
-    template="plotly_dark",
-    paper_bgcolor="#0b0f14",
-    plot_bgcolor="#0b0f14",
-    font=dict(color="#e8eef2"),
-    title=f"Final Damage Distribution (Global DC = {global_dc})",
-    xaxis_title="Final Damage Dealt",
-    yaxis_title="Probability",
-    hovermode="closest",
-    legend=dict(
-        bgcolor="rgba(17,22,29,0.7)",
-        bordercolor="rgba(255,255,255,0.15)",
-        borderwidth=1,
-    ),
-    margin=dict(l=30, r=30, t=50, b=30),
-)
+with chart_placeholder:
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#0b0f14",
+        plot_bgcolor="#0b0f14",
+        font=dict(color="#e8eef2"),
+        title=f"Final Damage Distribution (Global DC = {global_dc})",
+        xaxis_title="Final Damage Dealt",
+        yaxis_title="Probability",
+        hovermode="closest",
+        legend=dict(
+            bgcolor="rgba(17,22,29,0.70)",
+            bordercolor="rgba(255,255,255,0.15)",
+            borderwidth=1,
+        ),
+        margin=dict(l=30, r=30, t=50, b=30),
+    )
 
-fig.update_xaxes(gridcolor="rgba(120,140,160,0.18)")
-fig.update_yaxes(gridcolor="rgba(120,140,160,0.18)", tickformat=".0%")
+    fig.update_xaxes(gridcolor="rgba(120,140,160,0.18)")
+    fig.update_yaxes(gridcolor="rgba(120,140,160,0.18)", tickformat=".0%")
 
-st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
 # ----------------------------
 # Save comparison graph
 # ----------------------------
 st.subheader("Expected Damage vs Save Bonus")
-st.caption("Compares normal saves, advantage on saves, and disadvantage on saves.")
+st.caption("Normal vs advantage vs disadvantage on the save.")
 
 save_bonus_range = st.slider(
     "Save Bonus Range",
@@ -492,9 +521,39 @@ selected_spell = next(spell for spell in visible_spells if spell.name == selecte
 selected_dc = get_spell_dc(selected_spell, global_dc)
 
 bonus_values = list(range(save_bonus_range[0], save_bonus_range[1] + 1))
-normal_vals = [expected_spell_damage(selected_spell, bonus, selected_dc, mode="normal") for bonus in bonus_values]
-adv_vals = [expected_spell_damage(selected_spell, bonus, selected_dc, mode="advantage") for bonus in bonus_values]
-dis_vals = [expected_spell_damage(selected_spell, bonus, selected_dc, mode="disadvantage") for bonus in bonus_values]
+normal_vals = [
+    expected_spell_damage(
+        num_dice=selected_spell.num_dice,
+        die_size=selected_spell.die_size,
+        half_on_save=selected_spell.half_on_save,
+        save_bonus=bonus,
+        save_dc=selected_dc,
+        mode="normal",
+    )
+    for bonus in bonus_values
+]
+adv_vals = [
+    expected_spell_damage(
+        num_dice=selected_spell.num_dice,
+        die_size=selected_spell.die_size,
+        half_on_save=selected_spell.half_on_save,
+        save_bonus=bonus,
+        save_dc=selected_dc,
+        mode="advantage",
+    )
+    for bonus in bonus_values
+]
+dis_vals = [
+    expected_spell_damage(
+        num_dice=selected_spell.num_dice,
+        die_size=selected_spell.die_size,
+        half_on_save=selected_spell.half_on_save,
+        save_bonus=bonus,
+        save_dc=selected_dc,
+        mode="disadvantage",
+    )
+    for bonus in bonus_values
+]
 
 fig2 = go.Figure()
 
@@ -521,12 +580,13 @@ for label, y_vals, color in series:
         go.Scatter(
             x=bonus_values,
             y=y_vals,
-            mode="markers",
+            mode="lines+markers",
             name=label,
+            line=dict(color=color, width=3, shape="linear"),
             marker=dict(
                 color=color,
-                size=9,
-                line=dict(color="rgba(255,255,255,0.15)", width=0.8),
+                size=7,
+                line=dict(color="rgba(255,255,255,0.12)", width=0.8),
             ),
             hoverinfo="text",
             hovertext=hover_text,
@@ -543,7 +603,7 @@ fig2.update_layout(
     yaxis_title="Expected Damage",
     hovermode="closest",
     legend=dict(
-        bgcolor="rgba(17,22,29,0.7)",
+        bgcolor="rgba(17,22,29,0.70)",
         bordercolor="rgba(255,255,255,0.15)",
         borderwidth=1,
     ),
