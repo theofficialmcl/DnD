@@ -55,7 +55,7 @@ class Spell:
     half_on_save: bool
     enabled: bool = True
     color: str = "#8ecae6"
-    dc_mode: str = "Global"       # "Global" or "Custom"
+    dc_mode: str = "Global"   # "Global" or "Custom"
     custom_dc: int = 15
 
 
@@ -86,17 +86,40 @@ def dice_distribution(num_dice: int, die_size: int) -> Dict[int, float]:
     return dict(sorted(dist.items()))
 
 
-def save_success_probability(save_dc: int, save_bonus: int) -> float:
-    successes = 0
-    for roll in range(1, 21):
-        if roll + save_bonus >= save_dc:
-            successes += 1
-    return successes / 20.0
+def single_d20_distribution(mode: str = "normal") -> Dict[int, float]:
+    """
+    mode: 'normal', 'advantage', 'disadvantage'
+    Returns distribution of the final d20 result.
+    """
+    if mode == "normal":
+        return {r: 1 / 20 for r in range(1, 21)}
+
+    counts = Counter()
+    total = 20 * 20
+
+    for a in range(1, 21):
+        for b in range(1, 21):
+            if mode == "advantage":
+                counts[max(a, b)] += 1
+            elif mode == "disadvantage":
+                counts[min(a, b)] += 1
+            else:
+                raise ValueError("mode must be normal, advantage, or disadvantage")
+
+    return {r: counts[r] / total for r in range(1, 21)}
 
 
-def spell_outcome_distribution(spell: Spell, save_bonus: int, save_dc: int) -> Dict[int, float]:
+def save_success_probability(save_dc: int, save_bonus: int, mode: str = "normal") -> float:
+    d20_dist = single_d20_distribution(mode)
+    return sum(
+        prob for roll, prob in d20_dist.items()
+        if roll + save_bonus >= save_dc
+    )
+
+
+def spell_outcome_distribution(spell: Spell, save_bonus: int, save_dc: int, mode: str = "normal") -> Dict[int, float]:
     base_dist = dice_distribution(spell.num_dice, spell.die_size)
-    p_save = save_success_probability(save_dc, save_bonus)
+    p_save = save_success_probability(save_dc, save_bonus, mode=mode)
     p_fail = 1.0 - p_save
 
     final_dist = Counter()
@@ -125,22 +148,12 @@ def distribution_peak(distribution: Dict[int, float]) -> Tuple[int, float]:
     return peak_x, distribution[peak_x]
 
 
-def expected_spell_damage(spell: Spell, save_bonus: int, save_dc: int) -> float:
-    return expected_value(spell_outcome_distribution(spell, save_bonus, save_dc))
+def expected_spell_damage(spell: Spell, save_bonus: int, save_dc: int, mode: str = "normal") -> float:
+    return expected_value(spell_outcome_distribution(spell, save_bonus, save_dc, mode=mode))
 
 
 def get_spell_dc(spell: Spell, global_dc: int) -> int:
     return spell.custom_dc if spell.dc_mode == "Custom" else global_dc
-
-
-def add_alpha(hex_color: str, alpha_float: float) -> str:
-    hex_color = hex_color.lstrip("#")
-    if len(hex_color) != 6:
-        return f"rgba(142,202,230,{alpha_float})"
-    r = int(hex_color[0:2], 16)
-    g = int(hex_color[2:4], 16)
-    b = int(hex_color[4:6], 16)
-    return f"rgba({r},{g},{b},{alpha_float})"
 
 
 # ----------------------------
@@ -160,7 +173,7 @@ if "spells" not in st.session_state:
 # Header
 # ----------------------------
 st.title("D&D Spell Damage Analyzer")
-st.caption("Interactive spell distribution and expected damage tool with hover details, multiple spells, custom colors, and per-spell DC control.")
+st.caption("Hoverable damage distributions and save comparison for normal, advantage, and disadvantage.")
 
 
 # ----------------------------
@@ -181,7 +194,15 @@ with st.sidebar:
 
     st.divider()
     st.header("Global Save DC")
-    global_dc = st.slider("Global Spell Save DC", min_value=5, max_value=30, value=15, step=1)
+    global_dc = st.slider(
+        "Global Spell Save DC",
+        min_value=5,
+        max_value=30,
+        value=15,
+        step=1,
+        key="global_dc_slider",
+        on_change=lambda: None,
+    )
 
     st.divider()
     st.header("Add a Spell")
@@ -234,6 +255,7 @@ edited_spells: List[Spell] = []
 for i, spell in enumerate(st.session_state.spells):
     with st.expander(f"{spell.name} — {spell.num_dice}d{spell.die_size}", expanded=(i < 2)):
         c1, c2, c3, c4 = st.columns([1.4, 1, 1, 1])
+
         with c1:
             enabled = st.checkbox("Show spell", value=spell.enabled, key=f"enabled_{spell.id}")
             name = st.text_input("Name", value=spell.name, key=f"name_{spell.id}")
@@ -269,7 +291,6 @@ for i, spell in enumerate(st.session_state.spells):
             )
 
 st.session_state.spells = edited_spells
-
 visible_spells = [s for s in st.session_state.spells if s.enabled]
 
 if not visible_spells:
@@ -286,11 +307,11 @@ rows = []
 for spell in visible_spells:
     dc = get_spell_dc(spell, global_dc)
     save_bonus = int(target_saves[spell.save_stat])
-    dist = spell_outcome_distribution(spell, save_bonus, dc)
+    dist = spell_outcome_distribution(spell, save_bonus, dc, mode="normal")
     mean = expected_value(dist)
     sd = std_dev(dist, mean)
     peak_x, peak_p = distribution_peak(dist)
-    p_save = save_success_probability(dc, save_bonus)
+    p_save = save_success_probability(dc, save_bonus, mode="normal")
 
     rows.append(
         {
@@ -314,17 +335,18 @@ st.dataframe(pd.DataFrame(rows), use_container_width=True)
 # ----------------------------
 # Distribution graph
 # ----------------------------
-st.subheader("Spell Damage Distributions")
+st.subheader("Spell Damage Distribution")
 
-fill_curves = st.checkbox("Fill under curves", value=True)
-smooth_lines = st.checkbox("Smooth lines visually", value=True)
+show_mean = st.checkbox("Show mean markers", value=True)
+show_std = st.checkbox("Show ±1σ markers", value=True)
+show_peak = st.checkbox("Show peak markers", value=True)
 
 fig = go.Figure()
 
 for spell in visible_spells:
     dc = get_spell_dc(spell, global_dc)
     save_bonus = int(target_saves[spell.save_stat])
-    dist = spell_outcome_distribution(spell, save_bonus, dc)
+    dist = spell_outcome_distribution(spell, save_bonus, dc, mode="normal")
     mean = expected_value(dist)
     sd = std_dev(dist, mean)
     peak_x, peak_p = distribution_peak(dist)
@@ -347,61 +369,77 @@ for spell in visible_spells:
         for x, y in zip(x_vals, y_vals)
     ]
 
+    # Main distribution: markers only
     fig.add_trace(
         go.Scatter(
             x=x_vals,
             y=y_vals,
-            mode="lines",
+            mode="markers",
             name=spell.name,
-            line=dict(color=spell.color, width=3, shape="spline" if smooth_lines else "linear", smoothing=1.1),
-            fill="tozeroy" if fill_curves else None,
-            fillcolor=add_alpha(spell.color, 0.12),
+            marker=dict(
+                color=spell.color,
+                size=9,
+                line=dict(color="rgba(255,255,255,0.15)", width=0.8),
+            ),
             hoverinfo="text",
             hovertext=hover_text,
         )
     )
 
-    fig.add_trace(
-        go.Scatter(
-            x=[peak_x],
-            y=[peak_p],
-            mode="markers",
-            name=f"{spell.name} Peak",
-            marker=dict(color=spell.color, size=9, symbol="circle"),
-            showlegend=False,
-            hovertemplate=(
-                f"<b>{spell.name} Peak</b><br>"
-                f"Peak Damage: {peak_x}<br>"
-                f"Peak Probability: {peak_p:.3%}<br>"
-                f"Mean: {mean:.2f}<br>"
-                f"Std Dev: {sd:.2f}<extra></extra>"
-            ),
-        )
-    )
-
-    for x_value, dash_style, label in [
-        (mean, "dash", "Mean"),
-        (mean - sd, "dot", "Mean - 1σ"),
-        (mean + sd, "dot", "Mean + 1σ"),
-    ]:
-        fig.add_vline(
-            x=x_value,
-            line_width=1.5,
-            line_dash=dash_style,
-            line_color=spell.color,
-            opacity=0.9,
-        )
-
+    # Peak marker
+    if show_peak:
         fig.add_trace(
             go.Scatter(
-                x=[x_value],
-                y=[max(y_vals) * 0.96],
+                x=[peak_x],
+                y=[peak_p],
                 mode="markers",
-                marker=dict(size=8, color=spell.color, opacity=0.001),
+                name=f"{spell.name} Peak",
+                marker=dict(color=spell.color, size=15, symbol="diamond"),
                 showlegend=False,
                 hovertemplate=(
-                    f"<b>{spell.name} {label}</b><br>"
-                    f"Value: {x_value:.2f}<br>"
+                    f"<b>{spell.name} Peak</b><br>"
+                    f"Peak Damage: {peak_x}<br>"
+                    f"Peak Probability: {peak_p:.3%}<br>"
+                    f"Mean: {mean:.2f}<br>"
+                    f"Std Dev: {sd:.2f}<extra></extra>"
+                ),
+            )
+        )
+
+    # Mean marker
+    if show_mean:
+        mean_y = dist.get(int(round(mean)), 0.0)
+        fig.add_trace(
+            go.Scatter(
+                x=[mean],
+                y=[mean_y],
+                mode="markers",
+                name=f"{spell.name} Mean",
+                marker=dict(color=spell.color, size=14, symbol="x"),
+                showlegend=False,
+                hovertemplate=(
+                    f"<b>{spell.name} Mean</b><br>"
+                    f"Mean: {mean:.2f}<br>"
+                    f"Std Dev: {sd:.2f}<extra></extra>"
+                ),
+            )
+        )
+
+    # Std dev markers
+    if show_std:
+        left_x = mean - sd
+        right_x = mean + sd
+        fig.add_trace(
+            go.Scatter(
+                x=[left_x, right_x],
+                y=[0, 0],
+                mode="markers",
+                name=f"{spell.name} Std Dev",
+                marker=dict(color=spell.color, size=11, symbol="square-open"),
+                showlegend=False,
+                hovertemplate=(
+                    f"<b>{spell.name} Std Dev</b><br>"
+                    f"Value: %{ '{x:.2f}' }<br>"
                     f"Mean: {mean:.2f}<br>"
                     f"Std Dev: {sd:.2f}<extra></extra>"
                 ),
@@ -413,10 +451,10 @@ fig.update_layout(
     paper_bgcolor="#0b0f14",
     plot_bgcolor="#0b0f14",
     font=dict(color="#e8eef2"),
-    title=f"Final Damage Distributions (Global DC = {global_dc})",
+    title=f"Final Damage Distribution (Global DC = {global_dc})",
     xaxis_title="Final Damage Dealt",
     yaxis_title="Probability",
-    hovermode="x unified",
+    hovermode="closest",
     legend=dict(
         bgcolor="rgba(17,22,29,0.7)",
         bordercolor="rgba(255,255,255,0.15)",
@@ -428,68 +466,82 @@ fig.update_layout(
 fig.update_xaxes(gridcolor="rgba(120,140,160,0.18)")
 fig.update_yaxes(gridcolor="rgba(120,140,160,0.18)", tickformat=".0%")
 
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
 # ----------------------------
-# Expected damage vs DC graph
+# Save comparison graph
 # ----------------------------
-st.subheader("Expected Damage vs Save DC")
+st.subheader("Expected Damage vs Save Bonus")
+st.caption("Compares normal saves, advantage on saves, and disadvantage on saves.")
 
-dc_min, dc_max = st.slider(
-    "DC Range for Comparison",
-    min_value=5,
-    max_value=30,
-    value=(8, 22),
+save_bonus_range = st.slider(
+    "Save Bonus Range",
+    min_value=-5,
+    max_value=20,
+    value=(-2, 12),
     step=1,
 )
 
+selected_spell_name = st.selectbox(
+    "Spell for save comparison",
+    [spell.name for spell in visible_spells],
+)
+
+selected_spell = next(spell for spell in visible_spells if spell.name == selected_spell_name)
+selected_dc = get_spell_dc(selected_spell, global_dc)
+
+bonus_values = list(range(save_bonus_range[0], save_bonus_range[1] + 1))
+normal_vals = [expected_spell_damage(selected_spell, bonus, selected_dc, mode="normal") for bonus in bonus_values]
+adv_vals = [expected_spell_damage(selected_spell, bonus, selected_dc, mode="advantage") for bonus in bonus_values]
+dis_vals = [expected_spell_damage(selected_spell, bonus, selected_dc, mode="disadvantage") for bonus in bonus_values]
+
 fig2 = go.Figure()
 
-for spell in visible_spells:
-    save_bonus = int(target_saves[spell.save_stat])
-    dc_values = list(range(dc_min, dc_max + 1))
-    y_vals = [expected_spell_damage(spell, save_bonus, dc) for dc in dc_values]
+series = [
+    ("Normal", normal_vals, "#8ecae6"),
+    ("Advantage", adv_vals, "#90be6d"),
+    ("Disadvantage", dis_vals, "#f4a261"),
+]
 
+for label, y_vals, color in series:
     hover_text = [
         (
-            f"<b>{spell.name}</b><br>"
-            f"DC: {dc}<br>"
+            f"<b>{selected_spell.name}</b><br>"
+            f"Mode: {label}<br>"
+            f"Save Bonus: {bonus}<br>"
             f"Expected Damage: {y:.2f}<br>"
-            f"Save Stat: {spell.save_stat}<br>"
-            f"Target Save Bonus: {save_bonus}"
+            f"DC: {selected_dc}<br>"
+            f"Save Stat: {selected_spell.save_stat}"
         )
-        for dc, y in zip(dc_values, y_vals)
+        for bonus, y in zip(bonus_values, y_vals)
     ]
 
     fig2.add_trace(
         go.Scatter(
-            x=dc_values,
+            x=bonus_values,
             y=y_vals,
-            mode="lines",
-            name=spell.name,
-            line=dict(color=spell.color, width=3, shape="spline" if smooth_lines else "linear", smoothing=1.05),
+            mode="markers",
+            name=label,
+            marker=dict(
+                color=color,
+                size=9,
+                line=dict(color="rgba(255,255,255,0.15)", width=0.8),
+            ),
             hoverinfo="text",
             hovertext=hover_text,
         )
     )
-
-fig2.add_vline(
-    x=global_dc,
-    line_width=1.5,
-    line_dash="dash",
-    line_color="rgba(255,255,255,0.45)",
-)
 
 fig2.update_layout(
     template="plotly_dark",
     paper_bgcolor="#0b0f14",
     plot_bgcolor="#0b0f14",
     font=dict(color="#e8eef2"),
-    title="Expected Damage Across Different Save DCs",
-    xaxis_title="Save DC",
+    title=f"{selected_spell.name}: Expected Damage by Save Bonus",
+    xaxis_title="Target Save Bonus",
     yaxis_title="Expected Damage",
-    hovermode="x unified",
+    hovermode="closest",
     legend=dict(
         bgcolor="rgba(17,22,29,0.7)",
         bordercolor="rgba(255,255,255,0.15)",
@@ -501,4 +553,4 @@ fig2.update_layout(
 fig2.update_xaxes(gridcolor="rgba(120,140,160,0.18)")
 fig2.update_yaxes(gridcolor="rgba(120,140,160,0.18)")
 
-st.plotly_chart(fig2, use_container_width=True)
+st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
